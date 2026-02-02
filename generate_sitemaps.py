@@ -1,219 +1,157 @@
-# generate_sitemaps.py
+#!/usr/bin/env python3
+"""Generate sitemap.xml + ai-sitemap.xml with correct base URL.
+
+Why this exists
+- Google rejects sitemaps when the sitemap is hosted on one domain (e.g., https://sub.example.com/sitemap.xml)
+  but the <loc> URLs inside point to a different domain (e.g., https://owner.github.io/repo/...).
+
+What this script does
+- Uses your repo root CNAME (if present) as the canonical base URL.
+- Falls back to the default GitHub Pages URL if no CNAME exists.
+- Generates:
+    - sitemap.xml      (human-facing pages: *.html at repo root)
+    - ai-sitemap.xml   (machine-readable files in folders you choose)
+
+Safe to re-run
+- Overwrites sitemap.xml and ai-sitemap.xml (no -1/-2 duplicates).
+"""
+
+from __future__ import annotations
+
 import os
-import re
-import glob
-import subprocess
-from datetime import datetime
-from xml.etree.ElementTree import Element, SubElement, ElementTree
-from urllib.parse import quote
+import sys
+import argparse
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urljoin
 
-# ---------------------------
-# Repo root / env helpers
-# ---------------------------
-def _run(cmd):
-    try:
-        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8").strip()
-    except Exception:
+# ----------------------------
+# Base URL discovery
+# ----------------------------
+
+def _read_cname(repo_root: Path) -> str:
+    cname_path = repo_root / "CNAME"
+    if not cname_path.exists():
         return ""
+    txt = cname_path.read_text(encoding="utf-8").strip()
+    # CNAME can include comments/extra lines; take first non-empty token
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # drop protocol if someone pasted it
+        line = line.replace("https://", "").replace("http://", "")
+        return line.strip().strip("/")
+    return ""
 
-def find_repo_root():
-    """Walk up from this file until we find a directory containing either 'schemas' or '.git'."""
-    cur = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(6):
-        if os.path.isdir(os.path.join(cur, "schemas")) or os.path.isdir(os.path.join(cur, ".git")):
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    return os.path.dirname(os.path.abspath(__file__))
 
-def get_repo_slug():
-    """
-    Returns 'owner/repo' using (in order):
-    - GITHUB_REPOSITORY env
-    - git remote origin url
-    """
-    env_repo = os.getenv("GITHUB_REPOSITORY")
-    if env_repo and "/" in env_repo:
-        return env_repo
+def discover_base_url(repo_root: Path) -> str:
+    cname = _read_cname(repo_root)
+    if cname:
+        return f"https://{cname}/"
 
-    origin = _run(["git", "config", "--get", "remote.origin.url"])
-    m = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/\.]+)", origin or "")
-    if m:
-        return f"{m.group('owner')}/{m.group('repo')}"
+    repo_slug = os.getenv("GITHUB_REPOSITORY", "")  # owner/repo
+    if repo_slug and "/" in repo_slug:
+        owner, repo = repo_slug.split("/", 1)
+        return f"https://{owner}.github.io/{repo}/"
 
-    # Last resort: read .git/config
-    try:
-        with open(".git/config", "r", encoding="utf-8") as f:
-            cfg = f.read()
-        m = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/\.]+)", cfg)
-        if m:
-            return f"{m.group('owner')}/{m.group('repo')}"
-    except Exception:
-        pass
+    # last-resort fallback (still valid for local generation)
+    return "https://example.com/"
 
-    raise RuntimeError("Unable to determine owner/repo. Set GITHUB_REPOSITORY or add a git remote origin.")
 
-def get_branch_name():
-    """
-    Returns a branch/ref name using (in order):
-    - GITHUB_REF_NAME env (Actions)
-    - current git branch
-    - 'main' fallback
-    """
-    ref = os.getenv("GITHUB_REF_NAME")
-    if ref:
-        return ref
-    ref = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    return ref if ref and ref != "HEAD" else "main"
+# ----------------------------
+# File collection helpers
+# ----------------------------
 
-def get_raw_base_url(repo_slug: str, ref: str) -> str:
-    # raw URLs for files inside the repo (json/yaml/md/etc.)
-    # Later we append "/<path>", so no trailing slash here.
-    return f"https://raw.githubusercontent.com/{repo_slug}/{quote(ref)}"
+def _is_hidden(path: Path) -> bool:
+    return any(part.startswith(".") for part in path.parts)
 
-def get_pages_base_url(repo_slug: str) -> str:
-    """
-    If a CNAME file exists, use that as the site root.
-    Otherwise project pages: https://<owner>.github.io/<repo>
-    """
-    cname_path = "CNAME"
-    if os.path.isfile(cname_path):
-        try:
-            host = open(cname_path, "r", encoding="utf-8").read().strip()
-            if host:
-                host = host.replace("http://", "").replace("https://", "").strip("/")
-                return f"https://{host}"
-        except Exception:
-            pass
-    owner, repo = repo_slug.split("/", 1)
-    return f"https://{owner}.github.io/{repo}"
 
-# ---------------------------
-# File discovery
-# ---------------------------
-def find_generated_files(patterns=None):
-    """
-    Returns repo-relative paths for data files we want in the AI sitemap.
-    """
-    if patterns is None:
-        patterns = [
-            "schemas/**/*.json", "schemas/**/*.yaml", "schemas/**/*.yml",
-            "schemas/**/*.md", "schemas/**/*.llm",
-        ]
-    paths = set()
-    for pat in patterns:
-        matches = glob.glob(pat, recursive=True)
-        for p in matches:
-            if os.path.isfile(p):
-                paths.add(p.replace("\\", "/"))
-    paths = sorted(paths)
-    print(f"🔎 AI files discovered: {len(paths)}")
-    if paths:
-        print("   e.g.", paths[:3])
-    else:
-        print("   (No matches found. Working dir:", os.getcwd(), ")")
-        print("   schemas/ exists:", os.path.isdir("schemas"))
-    return paths
-
-def find_public_pages(extra_glob=False):
-    """
-    Public HTML pages we want in the standard sitemap.
-    By default includes the core set; if extra_glob=True, also include any *.html at repo root.
-    """
-    core = [
-        "index.html", "about.html", "services.html",
-        "testimonials.html", "faqs.html", "help.html", "contact.html",
-    ]
-    pages = [p for p in core if os.path.exists(p)]
-    if extra_glob:
-        for p in glob.glob("*.html"):
-            if p not in pages:
-                pages.append(p)
-    pages = sorted(pages)
-    print(f"🔎 Public pages discovered: {len(pages)}")
-    if pages:
-        print("   e.g.", pages[:5])
-    else:
-        print("   (No HTML pages found in", os.getcwd(), ")")
+def collect_html_pages(repo_root: Path) -> list[str]:
+    """Return relative paths for root-level HTML pages."""
+    pages: list[str] = []
+    for p in repo_root.glob("*.html"):
+        if p.is_file() and not _is_hidden(p):
+            pages.append(p.name)
+    # Stable order
+    pages.sort()
     return pages
 
-# ---------------------------
-# Sitemap writer (pretty-printed)
-# ---------------------------
-import xml.dom.minidom, io
 
-def write_sitemap(urls, out_file):
-    urlset = Element("urlset", attrib={
-        "xmlns": "http://www.sitemaps.org/schemas/sitemap/0.9"
-    })
-    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    for u in urls:
-        url_el = SubElement(urlset, "url")
-        SubElement(url_el, "loc").text = u
-        SubElement(url_el, "lastmod").text = now
+def collect_machine_files(repo_root: Path, folders: list[str], exts: list[str]) -> list[str]:
+    """Return relative paths for machine-readable files under given folders."""
+    rels: list[str] = []
+    for folder in folders:
+        base = repo_root / folder
+        if not base.exists() or not base.is_dir():
+            continue
+        for p in base.rglob("*"):
+            if not p.is_file() or _is_hidden(p):
+                continue
+            if p.suffix.lower() in exts:
+                rels.append(str(p.relative_to(repo_root)).replace("\\", "/"))
+    rels = sorted(set(rels))
+    return rels
 
-    rough = io.BytesIO()
-    ElementTree(urlset).write(rough, encoding="utf-8", xml_declaration=True)
-    pretty = xml.dom.minidom.parseString(rough.getvalue()).toprettyxml(indent="  ")
-    with open(out_file, "w", encoding="utf-8") as outf:
-        outf.write(pretty)
-    print(f"📝 Wrote {out_file} with {len(urls)} URL(s)")
 
-# ---------------------------
-# Main
-# ---------------------------
+# ----------------------------
+# XML writers
+# ----------------------------
+
+def write_sitemap(repo_root: Path, out_name: str, base_url: str, rel_paths: list[str]):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out_path = repo_root / out_name
+
+    # Always overwrite (no duplicates)
+    with out_path.open("w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
+        for rel in rel_paths:
+            loc = urljoin(base_url, rel)
+            f.write("  <url>\n")
+            f.write(f"    <loc>{loc}</loc>\n")
+            f.write(f"    <lastmod>{now}</lastmod>\n")
+            f.write("  </url>\n")
+        f.write("</urlset>\n")
+
+
 def main():
-    import argparse
-    ap = argparse.ArgumentParser(description="Generate sitemaps for GitHub-hosted data & pages.")
-    ap.add_argument("--repo", help="Override 'owner/repo' (default: auto-detect)")
-    ap.add_argument("--ref", help="Override branch/ref (default: auto-detect)")
-    ap.add_argument("--raw-base", help="Override raw base URL")
-    ap.add_argument("--pages-base", help="Override GitHub Pages base URL (or custom domain)")
-    ap.add_argument("--skip-ai", action="store_true", help="Skip ai-sitemap.xml")
-    ap.add_argument("--skip-pages", action="store_true", help="Skip sitemap.xml (HTML pages)")
-    ap.add_argument("--include-all-html", action="store_true", help="Also include any *.html at repo root")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo-root", default=".", help="Repo root (default: .)")
+    ap.add_argument(
+        "--machine-folders",
+        default="schemas,llm-data,faq-schemas,locations,organization",
+        help="Comma-separated folders to include in ai-sitemap.xml",
+    )
+    ap.add_argument(
+        "--machine-exts",
+        default=".json,.yaml,.yml,.jsonl,.md,.llm,.txt",
+        help="Comma-separated extensions to include in ai-sitemap.xml",
+    )
     args = ap.parse_args()
 
-    # Ensure we run from repo root
-    repo_root = find_repo_root()
+    repo_root = Path(args.repo_root).resolve()
     os.chdir(repo_root)
-    print(f"📂 Working directory: {repo_root}")
 
-    repo_slug = args.repo or get_repo_slug()
-    ref = args.ref or get_branch_name()
-    raw_base = args.raw_base or get_raw_base_url(repo_slug, ref)
-    pages_base = args.pages_base or get_pages_base_url(repo_slug)
+    base_url = discover_base_url(repo_root)
+    html_pages = collect_html_pages(repo_root)
 
-    print(f"📦 repo: {repo_slug}")
-    print(f"🌿 ref : {ref}")
-    print(f"📡 raw : {raw_base}")
-    print(f"🌐 pages: {pages_base}")
+    folders = [s.strip() for s in str(args.machine_folders).split(",") if s.strip()]
+    exts = [s.strip().lower() for s in str(args.machine_exts).split(",") if s.strip()]
+    machine_files = collect_machine_files(repo_root, folders, exts)
 
-    wrote_any = False
+    # Write output files
+    write_sitemap(repo_root, "sitemap.xml", base_url, html_pages)
+    write_sitemap(repo_root, "ai-sitemap.xml", base_url, machine_files)
 
-    # AI sitemap → raw machine-readable files
-    if not args.skip_ai:
-        data_files = find_generated_files()
-        ai_urls = [f"{raw_base}/{p}" for p in data_files]
-        write_sitemap(ai_urls, "ai-sitemap.xml")
-        wrote_any = wrote_any or bool(ai_urls)
+    print("✅ Generated sitemap.xml with", len(html_pages), "page URL(s)")
+    print("✅ Generated ai-sitemap.xml with", len(machine_files), "file URL(s)")
+    print("🌐 Base URL:", base_url)
 
-    # Standard sitemap → public HTML pages
-    if not args.skip_pages:
-        html_pages = find_public_pages(extra_glob=args.include_all_html)
-        page_urls = [f"{pages_base}/{p}" for p in html_pages]
-        write_sitemap(page_urls, "sitemap.xml")
-        wrote_any = wrote_any or bool(page_urls)
-
-    if not wrote_any:
-        print("⚠️ No URLs found for either sitemap. Check:")
-        print("   • Workflow order (generate data/pages BEFORE this step)")
-        print("   • Working directory (script should be run at repo root)")
-        print("   • That 'schemas/' and HTML files actually exist on the branch being built")
-
-    print("✅ Done.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("❌ sitemap generation failed:", e)
+        sys.exit(2)
