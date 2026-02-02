@@ -1,0 +1,95 @@
+name: Build Pages + Sitemaps + Robots & Ping
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'schemas/**'
+      - 'ai-generators/**'
+      - 'build_public_pages.py'
+      - 'generate_sitemaps.py'
+      - 'generate_robots.py'
+      - 'CNAME'
+      - '.github/workflows/auto-ping-sitemap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Build public pages
+        run: |
+          # Prefer root script; fall back to ai-generators/ for older repos
+          if [ -f build_public_pages.py ]; then
+            python build_public_pages.py
+          elif [ -f ai-generators/build_public_pages.py ]; then
+            python ai-generators/build_public_pages.py
+          else
+            echo "❌ build_public_pages.py not found in repo root or ai-generators/" >&2
+            exit 2
+          fi
+
+      - name: Generate sitemaps (CNAME-aware)
+        run: |
+          python generate_sitemaps.py --include-all-html
+
+      - name: Generate robots.txt (optional)
+        run: |
+          if [ -f generate_robots.py ]; then python generate_robots.py; fi
+
+      - name: Commit & push generated files (if changed)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "AUTO: Build pages + sitemaps" || echo "No changes to commit"
+          git push || true
+
+      - name: Ping Google & Bing
+        run: |
+          OWNER_REPO="${{ github.repository }}"
+          OWNER="${OWNER_REPO%/*}"
+          REPO="${OWNER_REPO#*/}"
+          BASE="https://${OWNER}.github.io/${REPO}"
+
+          # Prefer custom domain if CNAME exists
+          if [ -f CNAME ] && [ -s CNAME ]; then
+            HOST=$(cat CNAME | tr -d '\r' | sed 's#http://##; s#https://##' | tr -d '/')
+            if [ -n "$HOST" ]; then BASE="https://${HOST}"; fi
+          fi
+
+          PAGE_SITEMAP="${BASE}/sitemap.xml"
+          AI_SITEMAP="${BASE}/ai-sitemap.xml"
+
+          echo "📄 Page sitemap: ${PAGE_SITEMAP}"
+          echo "🤖 AI sitemap:   ${AI_SITEMAP}"
+
+          echo "→ Notifying Google (page sitemap)…"
+          curl -s -o /dev/null -w "%{http_code}\n" "https://www.google.com/ping?sitemap=${PAGE_SITEMAP}" || true
+
+          echo "→ Notifying Bing (page sitemap)…"
+          curl -s -o /dev/null -w "%{http_code}\n" "https://www.bing.com/ping?sitemap=${PAGE_SITEMAP}" || true
+
+          echo "→ (Optional) Notifying Google (AI sitemap)…"
+          curl -s -o /dev/null -w "%{http_code}\n" "https://www.google.com/ping?sitemap=${AI_SITEMAP}" || true
+
+          echo "→ (Optional) Notifying Bing (AI sitemap)…"
+          curl -s -o /dev/null -w "%{http_code}\n" "https://www.bing.com/ping?sitemap=${AI_SITEMAP}" || true
