@@ -15,8 +15,9 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-pages-${{ github.ref }}
+  group: pages-${{ github.repository }}
   cancel-in-progress: true
+
 
 jobs:
   build-pages-and-sitemaps:
