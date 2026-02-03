@@ -1,33 +1,31 @@
-name: Build public pages & sitemaps
+name: Build and Deploy GitHub Pages
 
 on:
   push:
+    branches: ["main"]
     paths:
       - "schemas/**"
       - "ai-generators/**"
       - "build_public_pages.py"
-      - "ai-generators/build_public_pages.py"
       - "generate_sitemaps.py"
-      - ".github/workflows/build-public-pages.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: pages-${{ github.repository }}
   cancel-in-progress: true
 
-
 jobs:
-  build-pages-and-sitemaps:
+  build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,41 +35,28 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pyyaml
+          pip install pyyaml pandas openpyxl
 
-      - name: Build public pages
+      - name: Build pages
         run: |
-          set -e
-          if [ -f "build_public_pages.py" ]; then
-            python build_public_pages.py
-          elif [ -f "ai-generators/build_public_pages.py" ]; then
-            python ai-generators/build_public_pages.py
-          else
-            echo "ERROR: build_public_pages.py not found in repo root or ai-generators/"
-            exit 1
-          fi
+          python build_public_pages.py
 
-      - name: Build sitemaps (if script exists)
+      - name: Build sitemap
         run: |
-          set -e
-          if [ -f "generate_sitemaps.py" ]; then
-            python generate_sitemaps.py
-          else
-            echo "No generate_sitemaps.py found — skipping."
-          fi
+          python generate_sitemaps.py
 
-      - name: Commit & push (only if changed)
-        run: |
-          set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
 
-          git add -A
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Auto-generate public pages"
-          git push
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
